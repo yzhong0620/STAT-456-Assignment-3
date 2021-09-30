@@ -1,0 +1,425 @@
+---
+title: 'Assignment #3'
+author: 'Yunyang Zhong'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r libraries}
+library(tidyverse)         # for graphing and data cleaning
+library(tidymodels)        # for modeling
+library(themis)            # for step functions for unbalanced data
+library(doParallel)        # for parallel processing
+library(stacks)            # for stacking models
+library(naniar)            # for examining missing values (NAs)
+library(lubridate)         # for date manipulation
+library(moderndive)        # for King County housing data
+library(vip)               # for variable importance plots
+library(patchwork)         # for combining plots nicely
+theme_set(theme_minimal()) # Lisa's favorite theme
+```
+
+```{r data}
+data("lending_club")
+# Data dictionary (as close as I could find): https://www.kaggle.com/wordsforthewise/lending-club/discussion/170691
+```
+
+When you finish the assignment, remove the `#` from the options chunk at the top, so that messages and warnings aren't printed. If you are getting errors in your code, add `error = TRUE` so that the file knits. I would recommend not removing the `#` until you are completely finished.
+
+## Put it on GitHub!        
+
+[gitHub](https://github.com/yzhong0620/STAT-456-Assignment-3)
+
+## Modeling
+
+We'll be using the `lending_club` dataset from the `modeldata` library, which is part of `tidymodels`. The data dictionary they reference doesn't seem to exist anymore, but it seems the one on this [kaggle discussion](https://www.kaggle.com/wordsforthewise/lending-club/discussion/170691) is pretty close. It might also help to read a bit about [Lending Club](https://en.wikipedia.org/wiki/LendingClub) before starting in on the exercises.
+
+The outcome we are interested in predicting is `Class`. And according to the dataset's help page, its values are "either 'good' (meaning that the loan was fully paid back or currently on-time) or 'bad' (charged off, defaulted, or 21-120 days late)".
+
+**Tasks:** 
+
+1. Explore the data, concentrating on examining distributions of variables and examining missing values. 
+
+```{r}
+lending_club %>% 
+  select(where(is.numeric)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "variable", 
+               values_to = "value") %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(vars(variable), 
+             scales = "free")
+```
+
+```{r}
+lending_club %>% 
+  select(where(is.factor)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "variable", 
+               values_to = "value") %>% 
+  ggplot(aes(x = value)) +
+  geom_bar() +
+  facet_wrap(vars(variable), 
+             scales = "free", 
+             nrow = 2)
+```
+
+```{r}
+lending_club %>% 
+  add_n_miss() %>% 
+  count(n_miss_all)
+```
+
+2. Split the data into training and test, putting 75\% in the training data. Stratify by `Class` (add `strata = `Class` to the `initial_split()` function).
+
+```{r}
+set.seed(494) # for reproducibility
+lending_split <- initial_split(lending_club, prop = 0.75, strata = Class)
+
+lending_training <- training(lending_split)
+lending_test <- testing(lending_split)
+```
+
+3. Set up the recipe and the pre-processing steps to build a lasso model. Some steps you should take:
+
+* Use `step_upsample()` from the `themis` library to upsample the "bad" category so that it is 50\% of the "good" category. Do this by setting `over_ratio = .5`.
+* Use `step_downsample()` from the `themis` library to downsample the "good" category so the bads and goods are even - set `under_ratio = 1`. Make sure to do this step AFTER `step_upsample()`.  
+* Make all integer variables numeric (I'd highly recommend using `step_mutate_at()` and using the `all_numeric()` helper or this will be a lot of code). This step might seem really weird right now, but we'll want to do this for the model interpretation we'll do in a later assignment.  
+* Think about grouping factor variables with many levels.  
+* Make categorical variables dummy variables (make sure NOT to do this to the outcome variable).  
+* Normalize quantitative variables.  
+
+Once you have that, use `prep()`, `juice()`, and `count()` to count the number of observations in each class. They should be equal. This dataset will be used in building the model, but the data without up and down sampling will be used in evaluation.
+
+```{r}
+set.seed(456)
+
+lasso_recipe <- recipe(Class ~ ., data = lending_training) %>% 
+  step_upsample(Class, over_ratio = 0.5) %>% 
+  step_downsample(Class, under_ratio = 1) %>% 
+  step_mutate_at(all_numeric(), fn = ~as.numeric(.)) %>%
+  step_mutate(addr_state = as.character(addr_state),
+              addr_state = 
+                case_when(
+                  addr_state %in% c("CT", "ME", "MA", "NH", "RI", "Vt", "NJ", "NY", "PA") ~ "northeast",
+                  addr_state %in% c("IL", "IN", "MI", "OH", "WI", "IA", "KS", "MN", "MO", "NE", "ND", "SD") ~ "midwest",
+                  addr_state %in% c("DE", "FL", "GA", "MD", "NC", "SC", "VA", "DC", "WV", "AL", "KY", "MS", "TN", "AR", "LA", "OK", "TX") ~ "south",
+                  addr_state %in% c("WA", "OR", "CA", "MT", "ID", "WY", "NV", "UT", "CO", "AZ", "NM", "HI") ~ "west",
+                  TRUE ~ addr_state),
+              addr_state = as.factor(addr_state),
+              sub_grade = as.character(sub_grade),
+              sub_grade =
+                case_when(
+                  "A" %in% sub_grade ~ "A",
+                  "B" %in% sub_grade ~ "B",
+                  "C" %in% sub_grade ~ "C",
+                  "D" %in% sub_grade ~ "D",
+                  "E" %in% sub_grade ~ "E",
+                  "F" %in% sub_grade ~ "F",
+                  "G" %in% sub_grade ~ "G",
+                  TRUE ~ sub_grade),
+              sub_grade = as.factor(sub_grade)
+              ) %>%
+  step_dummy(all_nominal(), 
+             -all_outcomes()) %>% 
+  step_normalize(all_predictors(), 
+                 -all_nominal())
+  
+lasso_recipe %>% 
+  prep(lending_training) %>%
+  juice() %>% 
+  group_by(Class) %>% 
+  count()
+```
+
+4. Set up the lasso model and workflow. We will tune the `penalty` parameter.
+
+```{r}
+lasso_mod <-
+  logistic_reg(mixture = 1) %>% 
+  set_engine("glmnet") %>% 
+  set_args(penalty = tune()) %>% 
+  set_mode("classification")
+
+
+lasso_wf <-
+  workflow() %>% 
+  add_recipe(lasso_recipe) %>% 
+  add_model(lasso_mod)
+```
+
+5. Set up the model tuning for the `penalty` parameter. Be sure to add the `control_stack_grid()` for the `control` argument so we can use these results later when we stack. Find the accuracy and area under the roc curve for the model with the best tuning parameter.  Use 5-fold cv.
+
+Tune:
+
+```{r}
+set.seed(494) #for reproducible 5-fold
+lending_cv <- vfold_cv(lending_training, v = 5)
+
+ctrl_grid <- control_stack_grid()
+
+penalty_grid <- grid_regular(penalty(),
+                             levels = 20)
+lasso_tune <- 
+  lasso_wf %>% 
+  tune_grid(
+    resamples = lending_cv,
+    grid = penalty_grid,
+    control = ctrl_grid
+    )
+
+lasso_tune %>% 
+  show_best(metric = "roc_auc")
+
+lasso_tune %>% 
+  show_best(metric = "accuracy")
+```
+
+> penalty=0.0263665090 is the best tuning parameter in terms of roc_auc, because it has the largest roc_auc, 0.7387930. In terms of accuracy, penalty=0.0885866790 is the best with the largest accuracy 0.7148220.
+
+6. Set up the recipe and the pre-processing steps to build a random forest model. You shouldn't have to do as many steps. The only steps you should need to do are making all integers numeric and the up and down sampling. 
+
+```{r}
+set.seed(456)
+
+rf_recipe <- recipe(Class ~ ., data = lending_training) %>% 
+  step_upsample(Class, over_ratio = 0.5) %>% 
+  step_downsample(Class, under_ratio = 1) %>% 
+  step_mutate_at(all_numeric(), fn = ~as.numeric(.))
+```
+
+7. Set up the random forest model and workflow. We will tune the `mtry` and `min_n` parameters and set the number of trees, `trees`, to 100 (otherwise the next steps take too long).
+
+```{r}
+rf_model <-
+  rand_forest(mtry = tune(),
+              min_n = tune(),
+              trees = 100) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+rf_workflow <-
+  workflow() %>% 
+  add_recipe(rf_recipe) %>% 
+  add_model(rf_model)
+```
+
+8. Set up the model tuning for both the `mtry` and `min_n` parameters. Be sure to add the `control_stack_grid()` for the `control` argument so we can use these results later when we stack. Use only 3 levels in the grid. For the `mtry` parameter, you need to put `finalize(mtry(), lending_training %>% select(-Class))` in as an argument instead of just `mtry()`, where `lending_training` is the name of your training data. This is because the `mtry()` grid will otherwise have unknowns in it. This part can take a while to run.
+
+```{r}
+ctrl_grid_rf <- control_stack_grid()
+
+grid_rf <- grid_regular(min_n(), finalize(mtry(), lending_training %>% select(-Class)), levels = 3)
+
+rf_tune <-
+  rf_workflow %>% 
+  tune_grid(
+    resamples = lending_cv,
+    grid = grid_rf,
+    control = ctrl_grid_rf
+  )
+```
+
+9. Find the best tuning parameters. What are the accuracy and area under the ROC curve for the model with those tuning parameters?
+
+```{r}
+rf_tune %>% 
+  show_best(metric = "roc_auc")
+
+rf_tune %>% 
+  show_best(metric = "accuracy")
+```
+
+> mtry=1 and min_n=40 are the best tuning parameters in terms of roc_auc, because they have the largest roc_auc, 0.7360888. In terms of accuracy, mtry=11 and min_n=2 are the best with the largest accuracy 0.9251894.
+
+10. Next, we will fit a boosted tree using xgboost. We will only tune the `learn_rate` parameter. I have specified the model, recipe, and workflow below already (uncomment the code - you can this by highlighting it and then in the code tab at the top, choose comment/uncomment lines). You need to set up a grid of ten values for the tuning parameter and tune the model. Be sure to add the `control_stack_grid()` for the `control` argument so we can use these results later when we stack.
+
+```{r}
+xgboost_spec <-
+  boost_tree(
+    trees = 1000,
+    min_n = 5,
+    tree_depth = 2,
+    learn_rate = tune(),
+    loss_reduction = 10^-5,
+    sample_size = 1) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+xgboost_recipe <- recipe(formula = Class ~ ., data = lending_training) %>%
+  step_upsample(Class, over_ratio = .5) %>%
+  step_downsample(Class, under_ratio = 1) %>%
+  step_mutate_at(all_numeric(),
+                 fn = ~as.numeric(.)) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_zv(all_predictors())
+
+xgboost_workflow <-
+  workflow() %>%
+  add_recipe(xgboost_recipe) %>%
+  add_model(xgboost_spec)
+
+set.seed(494)
+registerDoParallel() 
+
+ctrl_grid_boost <- control_stack_grid()
+
+grid_boost <- grid_regular(learn_rate(), levels = 10)
+
+boost_tune <-
+  xgboost_workflow %>% 
+  tune_grid(
+    resamples = lending_cv,
+    grid = grid_boost,
+    control = ctrl_grid_boost
+  )
+```
+
+11. Find the best tuning parameters. What are the accuracy and area under the ROC curve for the model with those tuning parameters?
+
+```{r}
+boost_tune %>% 
+  show_best(metric = "roc_auc")
+
+boost_tune %>% 
+  show_best(metric = "accuracy")
+```
+
+> learn_rate=1.661178e-03 is the best tuning parameter in terms of roc_auc, because it has the largest roc_auc, 0.7341642. In terms of accuracy, learn_rate=3.860353e-02 is the best with the largest accuracy 0.7568995.
+
+12. Create a model stack with the candidate models from the previous parts of the exercise and use the `blend_predictions()` function to find the coefficients of the stacked model. Create a plot examining the performance metrics for the different penalty parameters to assure you have captured the best one. If not, adjust the penalty. (HINT: use the `autoplot()` function). Which models are contributing most?
+
+```{r}
+lending_stack <-
+  stacks() %>% 
+  add_candidates(lasso_tune) %>% 
+  add_candidates(rf_tune) %>% 
+  add_candidates(boost_tune)
+```
+
+```{r}
+set.seed(494)
+
+lending_blend <-
+  lending_stack %>% 
+  blend_predictions()
+
+autoplot(lending_blend)
+autoplot(lending_blend, type = "weights")
+```
+
+> LASSO is contributing the most, following by random forest.
+
+13. Fit the final stacked model using `fit_members()`. Apply the model to the training data. Compute the accuracy, construct a confusion matrix, and create a density plot with `.pred_good` on the x-axis (the probability of a response of "good"), filled by `Class`. Comment on what you see. 
+
+```{r}
+lending_final_stack <-
+  lending_blend %>% 
+  fit_members()
+
+lending_training_preds <- 
+  lending_training %>%
+  bind_cols(predict(lending_final_stack, .))
+
+accuracy(lending_training_preds, Class, .pred_class)
+
+conf_mat(lending_training_preds, Class, .pred_class)
+
+lending_final_stack %>% 
+  predict(new_data = lending_training, type = "prob") %>% 
+  bind_cols(lending_training) %>% 
+  ggplot(aes(x = .pred_good)) +
+  geom_density(aes(fill = Class))
+```
+
+> The accuracy is 0.9481872 and the confusion matrix is printed above. From the plot we can see that all observations, no matter having a class=good or a class=bad, got a probability larger than 0.5, which explains why no observation is predicted as bad in the confusion matrix. However, it is also clear from the plot that observations with class=good mostly have probabilities larger than 0.9 while those with class=bad have probabilities around 0.85. We might change the cut-off point (for example, 0.85 instead of 0.5) to give better predictions.
+
+14. In the previous problem, you saw that although the accuracy was quite high, the true negative rate (aka sensitivity) was terrible. It's common to see this when one of the classes has low representation. What we want to do now is investigate what happens in each of our models. Below I've provided code to investigate the lasso model (where `lasso_tune` is the name of my tuning step). Do similar things for the random forest and xgboost models. If you'd like to have a better true negative rate, which models would you choose and how would you go about doing this in a less manual way (you don't need to write code to do it - just describe it in words). Be sure to remove the `eval=FALSE` when you are finished.
+
+```{r}
+lasso_tune %>% 
+  collect_predictions() %>% 
+  group_by(id, penalty) %>% 
+  summarize(accuracy = sum((Class == .pred_class))/n(),
+            true_neg_rate = sum(Class == "bad" & .pred_class == "bad")/sum(Class == "bad"),
+            true_pos_rate = sum(Class == "good" & .pred_class == "good")/sum(Class == "good")) %>% 
+  group_by(penalty) %>% 
+  summarize(across(accuracy:true_pos_rate, mean))
+
+rf_tune %>% 
+  collect_predictions() %>% 
+  group_by(id, mtry, min_n) %>% 
+  summarize(accuracy = sum((Class == .pred_class))/n(),
+            true_neg_rate = sum(Class == "bad" & .pred_class == "bad")/sum(Class == "bad"),
+            true_pos_rate = sum(Class == "good" & .pred_class == "good")/sum(Class == "good")) %>% 
+  group_by(mtry, min_n) %>% 
+  summarize(across(accuracy:true_pos_rate, mean))
+
+boost_tune %>%
+  collect_predictions() %>% 
+  group_by(id, learn_rate) %>% 
+  summarize(accuracy = sum((Class == .pred_class))/n(),
+            true_neg_rate = sum(Class == "bad" & .pred_class == "bad")/sum(Class == "bad"),
+            true_pos_rate = sum(Class == "good" & .pred_class == "good")/sum(Class == "good")) %>% 
+  group_by(learn_rate) %>% 
+  summarize(across(accuracy:true_pos_rate, mean))
+```
+
+> The lasso model gives a true negative rate of 0.6378605, the random forest model gives about 0.2 on average, and the xgboost model gives mostly higher than 0.65. I would choose lasso and xgboost models because their true negative rates are more acceptable. To improve it, I might add a filter during the process to only include models with true negative rate higher than, for example, 0.5.
+
+## Shiny app
+
+For this week, there is no code to turn in for this part. You are just going to need to think about the steps to take.
+
+If you are new to Shiny apps or it's been awhile since you've made one, visit the Shiny links on our course [Resource](https://advanced-ds-in-r.netlify.app/resources.html) page. I would recommend starting with my resource because it will be the most basic. 
+
+Everyone should watch the [Theming Shiny](https://youtu.be/b9WWNO4P2nY) talk by Carson Sievert so you can make your app look amazing.
+
+**Tasks:**
+
+In the future, you are going to create an app that allows a user to explore how the predicted probability of a loan being paid back (or maybe just the predicted class - either "good" or "bad") changes depending on the values of the predictor variables.
+
+For this week, I want you to answer the following questions:
+
+1. How can you save a model you built to use it later (like in the shiny app you'll create)?
+
+> saveRDS(model_name, "model_name.rds")
+
+2. For shiny apps that get published (like yours will), it's very important to have ALL the libraries that are used within the app loaded. If we were going to use the stacked model, which libraries do you think we'd need to load in our app?  
+
+> library(tidymodels), library(themis), library(doParallel), library(tidyverse), library(stacks), library(naniar), library(lubridate) 
+
+3. You'll want the user to be able to choose values for each variable in the model. How will you come up with the values they can choose for quantitative and categorical data? Give one example for each, either using code or in words.  
+
+```{r}
+summary(lending_club$all_util)
+summary(lending_club$verification_status)
+```
+
+> For quantitative data, I would summarize the variables and find their min and max to set the boundaries. For catagorical data, I would find all categories for each variable and make them available options.
+
+4. You will need to populate each variable with an initial value. Which value will you choose? Is there a nice way to do this programatically (ie. with code)?
+
+> For quantitative data, I would choose the median or mean value of each variable as the initial value. For categorical data, I would choose the catagory with the most observations. For example, as shown in the code below, I would choose 62 or 60.31 for all_util and Source_Verified for verification_status.
+
+```{r}
+median(lending_club$all_util)
+mean(lending_club$all_util)
+summary(lending_club$verification_status)
+```
+
+## Coded Bias
+
+We will be watching some of the [Coded Bias](https://www.codedbias.com/) film together on Thursday. It is streaming on Netflix. Write a short reflection. If you want some prompts, reflect on: What part of the film impacted you the most? Was there a part that surprised you and why? What emotions did you experience while watching?
+
+> I was impacted the most by the part in which residents of the building need facial recognization to get in the building and "were treated like animals." It is even worse that residents there are mainly black or brown people, which agrees with that some of the technology, especially if related to surveillance, would go to the minority groups first. I was also surprised after there was news about coded bias in amazon's program, they quickly improved their algorism and made the accuracy for minority groups to above 90% as well. This means it is not impossible to improve the program, but that no one was doing it. I felt really bad during and after watching it. I enjoy gathering information and drawing conclusions by analyzing data. But at the same time, I often feel nowadays people have little privacy because of data. It is a hard decision how to balance these two.
